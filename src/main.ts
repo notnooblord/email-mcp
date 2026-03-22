@@ -250,9 +250,39 @@ async function runHttpServer(): Promise<void> {
   const watcherService = new WatcherService(config.settings.watcher, config.accounts);
   const hooksService = new HooksService(config.settings.hooks, imapService);
 
-  // -- Express app (from MCP SDK) with DNS rebinding protection ---------------
+  // -- Express app -------------------------------------------------------------
+  // Pass host: '0.0.0.0' to disable the SDK's built-in localhost-only DNS
+  // rebinding protection.  Without this, the Host-header validation middleware
+  // rejects every request whose Host is not localhost / 127.0.0.1 / [::1],
+  // which silently blocks remote MCP clients such as Claude.ai.
+  // Security is already provided by the token query-parameter check below.
   const { createMcpExpressApp } = await import('@modelcontextprotocol/sdk/server/express.js');
-  const app = createMcpExpressApp();
+  // Suppress the SDK's "binding to 0.0.0.0 without DNS rebinding protection"
+  // warning — we intentionally accept remote hosts and rely on token auth.
+  const origWarn = console.warn;
+  console.warn = () => {};
+  const app = createMcpExpressApp({ host: '0.0.0.0' });
+  console.warn = origWarn;
+
+  // -- CORS -------------------------------------------------------------------
+  // Allow browser-based and remote MCP clients (e.g. Claude.ai) to connect.
+  const cors = (await import('cors')).default;
+  type RouteFn = (path: string, ...handlers: unknown[]) => void;
+  const expressApp = app as unknown as {
+    use: (...handlers: unknown[]) => void;
+    post: RouteFn;
+    get: RouteFn;
+    delete: RouteFn;
+    options: RouteFn;
+  };
+  expressApp.use(
+    cors({
+      origin: '*',
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      allowedHeaders: ['Content-Type', 'mcp-session-id', 'Last-Event-Id', 'Accept'],
+      exposedHeaders: ['mcp-session-id'],
+    }),
+  );
 
   // -- Session → transport map ------------------------------------------------
   const transports: Record<string, StreamableHTTPServerTransport> = {};
@@ -282,6 +312,9 @@ async function runHttpServer(): Promise<void> {
   // -- Token-checking middleware (applies to /mcp only) -----------------------
   const requireToken = (req: IncomingMessage, res: ServerResponse, next: NextFn): void => {
     if (!validateToken(req.url, token)) {
+      process.stderr.write(
+        `[email-mcp] 401 ${req.method} ${req.url?.split('?')[0]} — invalid or missing token\n`,
+      );
       sendJsonRpcError(res, 401, -32000, 'Unauthorized: invalid or missing token');
       return;
     }
@@ -395,11 +428,9 @@ async function runHttpServer(): Promise<void> {
   };
 
   // -- Register routes --------------------------------------------------------
-  type RouteFn = (path: string, ...handlers: unknown[]) => void;
-  const router = app as unknown as { post: RouteFn; get: RouteFn; delete: RouteFn };
-  router.post('/mcp', requireToken, mcpPostHandler);
-  router.get('/mcp', requireToken, mcpGetHandler);
-  router.delete('/mcp', requireToken, mcpDeleteHandler);
+  expressApp.post('/mcp', requireToken, mcpPostHandler);
+  expressApp.get('/mcp', requireToken, mcpGetHandler);
+  expressApp.delete('/mcp', requireToken, mcpDeleteHandler);
 
   // -- Scheduler (runs regardless of active sessions) -------------------------
   try {

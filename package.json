@@ -77,6 +77,7 @@
   "dependencies": {
     "@clack/prompts": "^1.0.1",
     "@modelcontextprotocol/sdk": "^1.26.0",
+    "cors": "^2.8.6",
     "imapflow": "^1.2.9",
     "node-ical": "^0.25.2",
     "nodemailer": "^8.0.1",
@@ -87,6 +88,7 @@
     "@biomejs/biome": "^2.4.2",
     "@eslint/compat": "^2.0.2",
     "@eslint/js": "^9.39.2",
+    "@types/cors": "^2.8.19",
     "@types/node": "^25.2.3",
     "@types/nodemailer": "^7.0.10",
     "@vitest/coverage-v8": "^4.0.18",

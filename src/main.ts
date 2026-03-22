@@ -4,13 +4,20 @@
  *
  * Subcommands:
  *   stdio     Run as MCP server over stdio (default)
+ *   http      Run as MCP server over Streamable HTTP
  *   setup     Interactive account setup wizard
  *   test      Test IMAP/SMTP connections
  *   config    Config management (show, path, init)
  *   scheduler Email scheduling management
  */
 
+import { randomUUID } from 'node:crypto';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
+
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import { loadConfig } from './config/loader.js';
 import ConnectionManager from './connections/manager.js';
@@ -39,6 +46,7 @@ Usage:
 
 Commands:
   stdio       Run as MCP server over stdio (default)
+  http        Run as MCP server over Streamable HTTP (requires MCP_EMAIL_HTTP_TOKEN)
   account     Account management (list, add, edit, delete)
   setup       Alias for 'account add'
   test        Test connections for all or a specific account
@@ -48,8 +56,13 @@ Commands:
   notify      Test and diagnose desktop notifications
   help        Show this help message
 
+Environment variables (http mode):
+  MCP_EMAIL_HTTP_TOKEN   Required. Shared secret for HTTP transport authentication.
+  MCP_EMAIL_HTTP_PORT    Optional. Port to listen on (default: 3000).
+
 Examples:
-  email-mcp                         # Start MCP server
+  email-mcp                         # Start MCP server (stdio)
+  email-mcp http                     # Start MCP server (HTTP, requires MCP_EMAIL_HTTP_TOKEN)
   email-mcp account list             # List configured accounts
   email-mcp account add              # Add a new email account
   email-mcp account edit personal    # Edit an account
@@ -174,12 +187,282 @@ async function runServer(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
+// ---------------------------------------------------------------------------
+// HTTP transport helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate the `token` query-parameter against the server secret.
+ *
+ * Uses constant-time comparison to prevent timing attacks.
+ *
+ * @returns `true` when the token is present and matches.
+ */
+// eslint-disable-next-line import-x/prefer-default-export
+export function validateToken(url: string | undefined, expectedToken: string): boolean {
+  if (!url) return false;
+  const parsed = new URL(url, 'http://localhost');
+  const provided = parsed.searchParams.get('token') ?? '';
+  if (provided.length === 0) return false;
+
+  // Constant-time comparison
+  const encoder = new TextEncoder();
+  const a = encoder.encode(provided);
+  const b = encoder.encode(expectedToken);
+  if (a.byteLength !== b.byteLength) return false;
+
+  // Use a simple constant-time comparison loop
+  let mismatch = 0;
+  for (let i = 0; i < a.byteLength; i += 1) {
+    // eslint-disable-next-line no-bitwise
+    mismatch |= a[i] ^ b[i];
+  }
+  return mismatch === 0;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport mode
+// ---------------------------------------------------------------------------
+
+async function runHttpServer(): Promise<void> {
+  const token = process.env.MCP_EMAIL_HTTP_TOKEN;
+  if (!token || token.length === 0) {
+    throw new Error(
+      'MCP_EMAIL_HTTP_TOKEN environment variable is required for HTTP transport.\n' +
+        'Set it to a secret string that clients must pass as ?token=<secret>.',
+    );
+  }
+
+  const port = parseInt(process.env.MCP_EMAIL_HTTP_PORT ?? '3000', 10);
+
+  const config = await loadConfig();
+
+  const oauthService = new OAuthService();
+  const connections = new ConnectionManager(config.accounts, oauthService);
+  const rateLimiter = new RateLimiter(config.settings.rateLimit);
+  const imapService = new ImapService(connections);
+  const smtpService = new SmtpService(connections, rateLimiter, imapService);
+  const templateService = new TemplateService();
+  const calendarService = new CalendarService();
+  const localCalendarService = new LocalCalendarService();
+  const remindersService = new RemindersService();
+  const schedulerService = new SchedulerService(smtpService, imapService);
+  const watcherService = new WatcherService(config.settings.watcher, config.accounts);
+  const hooksService = new HooksService(config.settings.hooks, imapService);
+
+  // -- Express app (from MCP SDK) with DNS rebinding protection ---------------
+  const { createMcpExpressApp } = await import('@modelcontextprotocol/sdk/server/express.js');
+  const app = createMcpExpressApp();
+
+  // -- Session → transport map ------------------------------------------------
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // -- Token-checking middleware (applies to /mcp only) -----------------------
+  type NextFn = (err?: unknown) => void;
+
+  const requireToken = (req: IncomingMessage, res: ServerResponse, next: NextFn): void => {
+    if (!validateToken(req.url, token)) {
+      (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
+        .status(401)
+        .json({
+          jsonrpc: '2.0',
+          error: { code: -32000, message: 'Unauthorized: invalid or missing token' },
+          id: null,
+        });
+      return;
+    }
+    next();
+  };
+
+  // -- MCP POST handler -------------------------------------------------------
+  const mcpPostHandler = async (
+    req: IncomingMessage & { body?: unknown },
+    res: ServerResponse,
+  ): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    try {
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+      } else if (!sessionId && isInitializeRequest(req.body)) {
+        const server = createServer();
+        bindServer(server);
+
+        registerAllTools(
+          server,
+          connections,
+          imapService,
+          smtpService,
+          config,
+          templateService,
+          calendarService,
+          localCalendarService,
+          remindersService,
+          schedulerService,
+          watcherService,
+          hooksService,
+        );
+        registerAllResources(server, connections, imapService, templateService, schedulerService);
+        registerAllPrompts(server);
+
+        transport = new StreamableHTTPServerTransport({
+          sessionIdGenerator: () => randomUUID(),
+          onsessioninitialized: (sid: string) => {
+            transports[sid] = transport;
+          },
+        });
+
+        transport.onclose = () => {
+          const sid = transport.sessionId;
+          if (sid && transports[sid]) {
+            delete transports[sid];
+          }
+        };
+
+        await server.connect(transport);
+
+        // Post-handshake: start hooks/watcher/scheduler per session
+        const lowLevelServer = server.server;
+        lowLevelServer.oninitialized = () => {
+          markInitialized();
+          // eslint-disable-next-line no-void
+          void (async () => {
+            try {
+              const clientCaps = lowLevelServer.getClientCapabilities?.() ?? {};
+              hooksService.start(lowLevelServer, { sampling: clientCaps.sampling != null });
+              await watcherService.start();
+            } catch {
+              // non-fatal
+            }
+          })();
+        };
+
+        await transport.handleRequest(req, res, req.body);
+        return;
+      } else {
+        (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
+          .status(400)
+          .json({
+            jsonrpc: '2.0',
+            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
+            id: null,
+          });
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch {
+      if (!(res as unknown as { headersSent: boolean }).headersSent) {
+        (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
+          .status(500)
+          .json({
+            jsonrpc: '2.0',
+            error: { code: -32603, message: 'Internal server error' },
+            id: null,
+          });
+      }
+    }
+  };
+
+  // -- MCP GET handler (SSE streams) ------------------------------------------
+  const mcpGetHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      (res as unknown as { status: (code: number) => { send: (body: string) => void } })
+        .status(400)
+        .send('Invalid or missing session ID');
+      return;
+    }
+    await transports[sessionId].handleRequest(req, res);
+  };
+
+  // -- MCP DELETE handler (session termination) -------------------------------
+  const mcpDeleteHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      (res as unknown as { status: (code: number) => { send: (body: string) => void } })
+        .status(400)
+        .send('Invalid or missing session ID');
+      return;
+    }
+    try {
+      await transports[sessionId].handleRequest(req, res);
+    } catch {
+      if (!(res as unknown as { headersSent: boolean }).headersSent) {
+        (res as unknown as { status: (code: number) => { send: (body: string) => void } })
+          .status(500)
+          .send('Error processing session termination');
+      }
+    }
+  };
+
+  // -- Register routes --------------------------------------------------------
+  type RouteFn = (path: string, ...handlers: unknown[]) => void;
+  const router = app as unknown as { post: RouteFn; get: RouteFn; delete: RouteFn };
+  router.post('/mcp', requireToken, mcpPostHandler);
+  router.get('/mcp', requireToken, mcpGetHandler);
+  router.delete('/mcp', requireToken, mcpDeleteHandler);
+
+  // -- Scheduler (runs regardless of active sessions) -------------------------
+  try {
+    const result = await schedulerService.checkAndSend();
+    if (result.sent > 0) {
+      process.stderr.write(`[email-mcp] Sent ${result.sent} overdue email(s) on startup\n`);
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  const schedulerInterval = setInterval(async () => {
+    try {
+      await schedulerService.checkAndSend();
+    } catch {
+      // Silent
+    }
+  }, 60_000);
+
+  // -- Start HTTP server ------------------------------------------------------
+  const httpServer = createHttpServer(
+    app as unknown as (req: IncomingMessage, res: ServerResponse) => void,
+  );
+  httpServer.listen(port, () => {
+    process.stderr.write(`[email-mcp] Streamable HTTP server listening on port ${port}\n`);
+    process.stderr.write(`[email-mcp] Endpoint: http://localhost:${port}/mcp?token=<secret>\n`);
+  });
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    clearInterval(schedulerInterval);
+    hooksService.stop();
+    await watcherService.stop();
+
+    await Promise.allSettled(
+      Object.keys(transports).map(async (sid) => {
+        await transports[sid].close();
+        delete transports[sid];
+      }),
+    );
+
+    await connections.closeAll();
+    httpServer.close();
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2] ?? 'stdio';
 
   switch (command) {
     case 'stdio':
       await runServer();
+      break;
+
+    case 'http':
+      await runHttpServer();
       break;
 
     case 'setup': {

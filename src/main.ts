@@ -257,18 +257,32 @@ async function runHttpServer(): Promise<void> {
   // -- Session → transport map ------------------------------------------------
   const transports: Record<string, StreamableHTTPServerTransport> = {};
 
-  // -- Token-checking middleware (applies to /mcp only) -----------------------
+  // -- JSON-RPC error helper --------------------------------------------------
   type NextFn = (err?: unknown) => void;
+  type ExpressRes = ServerResponse & {
+    status: (code: number) => ExpressRes;
+    json: (body: unknown) => ExpressRes;
+    send: (body: string) => ExpressRes;
+    headersSent: boolean;
+  };
 
+  function sendJsonRpcError(
+    res: ServerResponse,
+    statusCode: number,
+    code: number,
+    message: string,
+  ): void {
+    (res as ExpressRes).status(statusCode).json({
+      jsonrpc: '2.0',
+      error: { code, message },
+      id: null,
+    });
+  }
+
+  // -- Token-checking middleware (applies to /mcp only) -----------------------
   const requireToken = (req: IncomingMessage, res: ServerResponse, next: NextFn): void => {
     if (!validateToken(req.url, token)) {
-      (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
-        .status(401)
-        .json({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Unauthorized: invalid or missing token' },
-          id: null,
-        });
+      sendJsonRpcError(res, 401, -32000, 'Unauthorized: invalid or missing token');
       return;
     }
     next();
@@ -342,26 +356,14 @@ async function runHttpServer(): Promise<void> {
         await transport.handleRequest(req, res, req.body);
         return;
       } else {
-        (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
-          .status(400)
-          .json({
-            jsonrpc: '2.0',
-            error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-            id: null,
-          });
+        sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
         return;
       }
 
       await transport.handleRequest(req, res, req.body);
     } catch {
-      if (!(res as unknown as { headersSent: boolean }).headersSent) {
-        (res as unknown as { status: (code: number) => { json: (body: unknown) => void } })
-          .status(500)
-          .json({
-            jsonrpc: '2.0',
-            error: { code: -32603, message: 'Internal server error' },
-            id: null,
-          });
+      if (!(res as ExpressRes).headersSent) {
+        sendJsonRpcError(res, 500, -32603, 'Internal server error');
       }
     }
   };
@@ -370,9 +372,7 @@ async function runHttpServer(): Promise<void> {
   const mcpGetHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
-      (res as unknown as { status: (code: number) => { send: (body: string) => void } })
-        .status(400)
-        .send('Invalid or missing session ID');
+      (res as ExpressRes).status(400).send('Invalid or missing session ID');
       return;
     }
     await transports[sessionId].handleRequest(req, res);
@@ -382,18 +382,14 @@ async function runHttpServer(): Promise<void> {
   const mcpDeleteHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
-      (res as unknown as { status: (code: number) => { send: (body: string) => void } })
-        .status(400)
-        .send('Invalid or missing session ID');
+      (res as ExpressRes).status(400).send('Invalid or missing session ID');
       return;
     }
     try {
       await transports[sessionId].handleRequest(req, res);
     } catch {
-      if (!(res as unknown as { headersSent: boolean }).headersSent) {
-        (res as unknown as { status: (code: number) => { send: (body: string) => void } })
-          .status(500)
-          .send('Error processing session termination');
+      if (!(res as ExpressRes).headersSent) {
+        (res as ExpressRes).status(500).send('Error processing session termination');
       }
     }
   };
@@ -424,6 +420,8 @@ async function runHttpServer(): Promise<void> {
   }, 60_000);
 
   // -- Start HTTP server ------------------------------------------------------
+  // Express app is a callable (req, res) => void compatible with Node's http.createServer,
+  // but its TypeScript type doesn't directly match Node's RequestListener signature.
   const httpServer = createHttpServer(
     app as unknown as (req: IncomingMessage, res: ServerResponse) => void,
   );

@@ -260,7 +260,12 @@ async function runHttpServer(): Promise<void> {
   // Suppress the SDK's "binding to 0.0.0.0 without DNS rebinding protection"
   // warning — we intentionally accept remote hosts and rely on token auth.
   const origWarn = console.warn;
-  console.warn = () => {};
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  // biome-ignore lint/suspicious/noExplicitAny: console.warn accepts any args
+  console.warn = (...args: any[]) => {
+    if (typeof args[0] === 'string' && args[0].includes('DNS rebinding protection')) return;
+    origWarn.apply(console, args);
+  };
   const app = createMcpExpressApp({ host: '0.0.0.0' });
   console.warn = origWarn;
 

@@ -282,8 +282,14 @@ async function runHttpServer(): Promise<void> {
     cors({
       origin: '*',
       methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
-      allowedHeaders: ['Content-Type', 'mcp-session-id', 'Last-Event-Id', 'Accept'],
-      exposedHeaders: ['mcp-session-id'],
+      allowedHeaders: [
+        'Content-Type',
+        'Accept',
+        'mcp-session-id',
+        'mcp-protocol-version',
+        'Last-Event-Id',
+      ],
+      exposedHeaders: ['mcp-session-id', 'mcp-protocol-version'],
     }),
   );
 
@@ -336,7 +342,9 @@ async function runHttpServer(): Promise<void> {
 
       if (sessionId && transports[sessionId]) {
         transport = transports[sessionId];
+        process.stderr.write(`[email-mcp] POST /mcp (session ${sessionId.slice(0, 8)}…)\n`);
       } else if (!sessionId && isInitializeRequest(req.body)) {
+        process.stderr.write('[email-mcp] POST /mcp — initialize (new session)\n');
         const server = createServer();
         bindServer(server);
 
@@ -359,6 +367,7 @@ async function runHttpServer(): Promise<void> {
 
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
+          enableJsonResponse: true,
           onsessioninitialized: (sid: string) => {
             transports[sid] = transport;
             process.stderr.write(`[email-mcp] session created: ${sid}\n`);
@@ -399,12 +408,18 @@ async function runHttpServer(): Promise<void> {
         await transport.handleRequest(req, res, req.body);
         return;
       } else {
+        process.stderr.write(
+          `[email-mcp] POST /mcp — rejected: session=${sessionId ?? 'none'}, ` +
+            `isInit=${isInitializeRequest(req.body)}\n`,
+        );
         sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
         return;
       }
 
       await transport.handleRequest(req, res, req.body);
-    } catch {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[email-mcp] POST /mcp error: ${msg}\n`);
       if (!(res as ExpressRes).headersSent) {
         sendJsonRpcError(res, 500, -32603, 'Internal server error');
       }
@@ -415,9 +430,13 @@ async function runHttpServer(): Promise<void> {
   const mcpGetHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
+      process.stderr.write(
+        `[email-mcp] GET /mcp — rejected: session=${sessionId ?? 'none'} not found\n`,
+      );
       (res as ExpressRes).status(400).send('Invalid or missing session ID');
       return;
     }
+    process.stderr.write(`[email-mcp] GET /mcp — SSE stream (session ${sessionId.slice(0, 8)}…)\n`);
     await transports[sessionId].handleRequest(req, res);
   };
 
@@ -425,12 +444,20 @@ async function runHttpServer(): Promise<void> {
   const mcpDeleteHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
+      process.stderr.write(
+        `[email-mcp] DELETE /mcp — rejected: session=${sessionId ?? 'none'} not found\n`,
+      );
       (res as ExpressRes).status(400).send('Invalid or missing session ID');
       return;
     }
+    process.stderr.write(
+      `[email-mcp] DELETE /mcp — terminating session ${sessionId.slice(0, 8)}…\n`,
+    );
     try {
       await transports[sessionId].handleRequest(req, res);
-    } catch {
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[email-mcp] DELETE /mcp error: ${msg}\n`);
       if (!(res as ExpressRes).headersSent) {
         (res as ExpressRes).status(500).send('Error processing session termination');
       }

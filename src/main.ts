@@ -330,6 +330,14 @@ async function runHttpServer(): Promise<void> {
     next();
   };
 
+  // -- Helpers: extract JSON-RPC method from req.body for diagnostics ---------
+  function rpcMethod(body: unknown): string {
+    if (body && typeof body === 'object' && 'method' in body) {
+      return String((body as { method: unknown }).method);
+    }
+    return '?';
+  }
+
   // -- MCP POST handler -------------------------------------------------------
   const mcpPostHandler = async (
     req: IncomingMessage & { body?: unknown },
@@ -342,7 +350,9 @@ async function runHttpServer(): Promise<void> {
 
       if (sessionId && transports[sessionId]) {
         transport = transports[sessionId];
-        process.stderr.write(`[email-mcp] POST /mcp (session ${sessionId.slice(0, 8)}…)\n`);
+        process.stderr.write(
+          `[email-mcp] POST /mcp ${rpcMethod(req.body)} (session ${sessionId.slice(0, 8)}…)\n`,
+        );
       } else if (!sessionId && isInitializeRequest(req.body)) {
         process.stderr.write('[email-mcp] POST /mcp — initialize (new session)\n');
         const server = createServer();
@@ -369,8 +379,13 @@ async function runHttpServer(): Promise<void> {
           sessionIdGenerator: () => randomUUID(),
           enableJsonResponse: true,
           onsessioninitialized: (sid: string) => {
-            transports[sid] = transport;
-            process.stderr.write(`[email-mcp] session created: ${sid}\n`);
+            try {
+              transports[sid] = transport;
+              process.stderr.write(`[email-mcp] session created: ${sid}\n`);
+            } catch (cbErr: unknown) {
+              const cbMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+              process.stderr.write(`[email-mcp] onsessioninitialized error: ${cbMsg}\n`);
+            }
           },
         });
 
@@ -406,6 +421,15 @@ async function runHttpServer(): Promise<void> {
         };
 
         await transport.handleRequest(req, res, req.body);
+
+        // Fallback: ensure session is stored even if onsessioninitialized had
+        // a timing issue (e.g. race between @hono/node-server and Express).
+        const sid = transport.sessionId;
+        if (sid && !transports[sid]) {
+          transports[sid] = transport;
+          process.stderr.write(`[email-mcp] session stored (fallback): ${sid}\n`);
+        }
+
         return;
       } else {
         process.stderr.write(

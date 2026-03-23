@@ -251,20 +251,20 @@ async function runHttpServer(): Promise<void> {
   const hooksService = new HooksService(config.settings.hooks, imapService);
 
   // -- Express app -------------------------------------------------------------
-  // Pass host: '0.0.0.0' to disable the SDK's built-in localhost-only DNS
-  // rebinding protection.  Without this, the Host-header validation middleware
-  // rejects every request whose Host is not localhost / 127.0.0.1 / [::1],
-  // which silently blocks remote MCP clients such as Claude.ai.
+  // Pass host: '::' to disable the SDK's localhost-only DNS rebinding
+  // protection AND enable dual-stack (IPv4 + IPv6) listening.  Without this
+  // the Host-header validation middleware rejects every request whose Host is
+  // not localhost / 127.0.0.1 / [::1], silently blocking remote MCP clients.
   // Security is already provided by the token query-parameter check below.
   const { createMcpExpressApp } = await import('@modelcontextprotocol/sdk/server/express.js');
-  // Suppress the SDK's "binding to 0.0.0.0 without DNS rebinding protection"
+  // Suppress the SDK's "binding to :: without DNS rebinding protection"
   // warning — we intentionally accept remote hosts and rely on token auth.
   const origWarn = console.warn;
   console.warn = (...args: unknown[]) => {
     if (typeof args[0] === 'string' && args[0].includes('DNS rebinding protection')) return;
     origWarn.apply(console, args as Parameters<typeof console.warn>);
   };
-  const app = createMcpExpressApp({ host: '0.0.0.0' });
+  const app = createMcpExpressApp({ host: '::' });
   console.warn = origWarn;
 
   // -- CORS -------------------------------------------------------------------
@@ -361,6 +361,7 @@ async function runHttpServer(): Promise<void> {
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid: string) => {
             transports[sid] = transport;
+            process.stderr.write(`[email-mcp] session created: ${sid}\n`);
           },
         });
 
@@ -368,7 +369,13 @@ async function runHttpServer(): Promise<void> {
           const sid = transport.sessionId;
           if (sid && transports[sid]) {
             delete transports[sid];
+            process.stderr.write(`[email-mcp] session closed: ${sid}\n`);
           }
+        };
+
+        transport.onerror = (err: Error) => {
+          const sid = transport.sessionId ?? 'unknown';
+          process.stderr.write(`[email-mcp] transport error (session ${sid}): ${err.message}\n`);
         };
 
         await server.connect(transport);
@@ -435,6 +442,11 @@ async function runHttpServer(): Promise<void> {
   expressApp.get('/mcp', requireToken, mcpGetHandler);
   expressApp.delete('/mcp', requireToken, mcpDeleteHandler);
 
+  // Health-check endpoint (no token required) — useful for load-balancer probes.
+  expressApp.get('/health', (_req: unknown, res: unknown) => {
+    (res as ExpressRes).status(200).json({ status: 'ok', version: PKG_VERSION });
+  });
+
   // -- Scheduler (runs regardless of active sessions) -------------------------
   try {
     const result = await schedulerService.checkAndSend();
@@ -459,9 +471,26 @@ async function runHttpServer(): Promise<void> {
   const httpServer = createHttpServer(
     app as unknown as (req: IncomingMessage, res: ServerResponse) => void,
   );
-  httpServer.listen(port, () => {
-    process.stderr.write(`[email-mcp] Streamable HTTP server listening on port ${port}\n`);
-    process.stderr.write(`[email-mcp] Endpoint: http://localhost:${port}/mcp?token=<secret>\n`);
+
+  // Increase timeouts for long-lived SSE connections.  The Node.js defaults
+  // (keepAliveTimeout 5 s, headersTimeout 60 s, requestTimeout 5 min) are far
+  // too short for MCP SSE streams that may stay open for the entire session.
+  // Setting to 0 disables the timeout so the connections stay open until the
+  // client disconnects or the server shuts down.
+  httpServer.keepAliveTimeout = 0;
+  httpServer.headersTimeout = 0;
+  httpServer.requestTimeout = 0;
+
+  // Log server-level errors so that they're not silently swallowed.
+  httpServer.on('error', (err: Error) => {
+    process.stderr.write(`[email-mcp] HTTP server error: ${err.message}\n`);
+  });
+
+  // Listen on '::' for dual-stack IPv4 + IPv6 support (important when
+  // connecting via DNS which may resolve to either protocol).
+  httpServer.listen(port, '::', () => {
+    process.stderr.write(`[email-mcp] Streamable HTTP server listening on [::]:${port}\n`);
+    process.stderr.write(`[email-mcp] Endpoint: http://<host>:${port}/mcp?token=<secret>\n`);
   });
 
   // Graceful shutdown

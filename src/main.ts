@@ -4,13 +4,20 @@
  *
  * Subcommands:
  *   stdio     Run as MCP server over stdio (default)
+ *   http      Run as MCP server over Streamable HTTP
  *   setup     Interactive account setup wizard
  *   test      Test IMAP/SMTP connections
  *   config    Config management (show, path, init)
  *   scheduler Email scheduling management
  */
 
+import { randomUUID } from 'node:crypto';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+import { createServer as createHttpServer } from 'node:http';
+
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 
 import { loadConfig } from './config/loader.js';
 import ConnectionManager from './connections/manager.js';
@@ -39,6 +46,7 @@ Usage:
 
 Commands:
   stdio       Run as MCP server over stdio (default)
+  http        Run as MCP server over Streamable HTTP (requires MCP_EMAIL_HTTP_TOKEN)
   account     Account management (list, add, edit, delete)
   setup       Alias for 'account add'
   test        Test connections for all or a specific account
@@ -48,8 +56,13 @@ Commands:
   notify      Test and diagnose desktop notifications
   help        Show this help message
 
+Environment variables (http mode):
+  MCP_EMAIL_HTTP_TOKEN   Required. Shared secret for HTTP transport authentication.
+  MCP_EMAIL_HTTP_PORT    Optional. Port to listen on (default: 3000).
+
 Examples:
-  email-mcp                         # Start MCP server
+  email-mcp                         # Start MCP server (stdio)
+  email-mcp http                     # Start MCP server (HTTP, requires MCP_EMAIL_HTTP_TOKEN)
   email-mcp account list             # List configured accounts
   email-mcp account add              # Add a new email account
   email-mcp account edit personal    # Edit an account
@@ -174,12 +187,440 @@ async function runServer(): Promise<void> {
   process.on('SIGTERM', shutdown);
 }
 
+// ---------------------------------------------------------------------------
+// HTTP transport helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate the `token` query-parameter against the server secret.
+ *
+ * Uses constant-time comparison to prevent timing attacks.
+ *
+ * @returns `true` when the token is present and matches.
+ */
+// eslint-disable-next-line import-x/prefer-default-export
+export function validateToken(url: string | undefined, expectedToken: string): boolean {
+  if (!url) return false;
+  const parsed = new URL(url, 'http://localhost');
+  const provided = parsed.searchParams.get('token') ?? '';
+  if (provided.length === 0) return false;
+
+  // Constant-time comparison
+  const encoder = new TextEncoder();
+  const a = encoder.encode(provided);
+  const b = encoder.encode(expectedToken);
+  if (a.byteLength !== b.byteLength) return false;
+
+  // Use a simple constant-time comparison loop
+  let mismatch = 0;
+  for (let i = 0; i < a.byteLength; i += 1) {
+    // eslint-disable-next-line no-bitwise
+    mismatch |= a[i] ^ b[i];
+  }
+  return mismatch === 0;
+}
+
+// ---------------------------------------------------------------------------
+// HTTP transport mode
+// ---------------------------------------------------------------------------
+
+async function runHttpServer(): Promise<void> {
+  const token = process.env.MCP_EMAIL_HTTP_TOKEN;
+  if (!token || token.length === 0) {
+    throw new Error(
+      'MCP_EMAIL_HTTP_TOKEN environment variable is required for HTTP transport.\n' +
+        'Set it to a secret string that clients must pass as ?token=<secret>.',
+    );
+  }
+
+  const port = parseInt(process.env.MCP_EMAIL_HTTP_PORT ?? '3000', 10);
+
+  const config = await loadConfig();
+
+  const oauthService = new OAuthService();
+  const connections = new ConnectionManager(config.accounts, oauthService);
+  const rateLimiter = new RateLimiter(config.settings.rateLimit);
+  const imapService = new ImapService(connections);
+  const smtpService = new SmtpService(connections, rateLimiter, imapService);
+  const templateService = new TemplateService();
+  const calendarService = new CalendarService();
+  const localCalendarService = new LocalCalendarService();
+  const remindersService = new RemindersService();
+  const schedulerService = new SchedulerService(smtpService, imapService);
+  const watcherService = new WatcherService(config.settings.watcher, config.accounts);
+  const hooksService = new HooksService(config.settings.hooks, imapService);
+
+  // -- Express app -------------------------------------------------------------
+  // Pass host: '::' to disable the SDK's localhost-only DNS rebinding
+  // protection AND enable dual-stack (IPv4 + IPv6) listening.  Without this
+  // the Host-header validation middleware rejects every request whose Host is
+  // not localhost / 127.0.0.1 / [::1], silently blocking remote MCP clients.
+  // Security is already provided by the token query-parameter check below.
+  const { createMcpExpressApp } = await import('@modelcontextprotocol/sdk/server/express.js');
+  // Suppress the SDK's "binding to :: without DNS rebinding protection"
+  // warning — we intentionally accept remote hosts and rely on token auth.
+  const origWarn = console.warn;
+  console.warn = (...args: unknown[]) => {
+    if (typeof args[0] === 'string' && args[0].includes('DNS rebinding protection')) return;
+    origWarn.apply(console, args as Parameters<typeof console.warn>);
+  };
+  const app = createMcpExpressApp({ host: '::' });
+  console.warn = origWarn;
+
+  // -- CORS -------------------------------------------------------------------
+  // Allow browser-based and remote MCP clients (e.g. Claude.ai) to connect.
+  const cors = (await import('cors')).default;
+  type RouteFn = (path: string, ...handlers: unknown[]) => void;
+  const expressApp = app as unknown as {
+    use: (...handlers: unknown[]) => void;
+    post: RouteFn;
+    get: RouteFn;
+    delete: RouteFn;
+    options: RouteFn;
+  };
+  expressApp.use(
+    cors({
+      origin: '*',
+      methods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
+      allowedHeaders: [
+        'Content-Type',
+        'Accept',
+        'mcp-session-id',
+        'mcp-protocol-version',
+        'Last-Event-Id',
+      ],
+      exposedHeaders: ['mcp-session-id', 'mcp-protocol-version'],
+    }),
+  );
+
+  // -- Session → transport map ------------------------------------------------
+  const transports: Record<string, StreamableHTTPServerTransport> = {};
+
+  // -- JSON-RPC error helper --------------------------------------------------
+  type NextFn = (err?: unknown) => void;
+  type ExpressRes = ServerResponse & {
+    status: (code: number) => ExpressRes;
+    json: (body: unknown) => ExpressRes;
+    send: (body: string) => ExpressRes;
+    headersSent: boolean;
+  };
+
+  function sendJsonRpcError(
+    res: ServerResponse,
+    statusCode: number,
+    code: number,
+    message: string,
+  ): void {
+    (res as ExpressRes).status(statusCode).json({
+      jsonrpc: '2.0',
+      error: { code, message },
+      id: null,
+    });
+  }
+
+  // -- Token-checking middleware (applies to /mcp only) -----------------------
+  const requireToken = (req: IncomingMessage, res: ServerResponse, next: NextFn): void => {
+    if (!validateToken(req.url, token)) {
+      process.stderr.write(
+        `[email-mcp] 401 ${req.method} ${req.url?.split('?')[0]} — invalid or missing token\n`,
+      );
+      sendJsonRpcError(res, 401, -32000, 'Unauthorized: invalid or missing token');
+      return;
+    }
+    next();
+  };
+
+  // -- Helpers: extract JSON-RPC method from req.body for diagnostics ---------
+  function rpcMethod(body: unknown): string {
+    if (body && typeof body === 'object' && 'method' in body) {
+      return String((body as { method: unknown }).method);
+    }
+    return '?';
+  }
+
+  // -- Session initialisation helper ------------------------------------------
+  // Creates a fully-configured MCP server + transport.
+  // If `recoverSessionId` is supplied the transport is force-initialised with
+  // that ID so it can immediately accept non-init requests (session recovery).
+  async function initSession(recoverSessionId?: string): Promise<StreamableHTTPServerTransport> {
+    const server = createServer();
+    bindServer(server);
+
+    registerAllTools(
+      server,
+      connections,
+      imapService,
+      smtpService,
+      config,
+      templateService,
+      calendarService,
+      localCalendarService,
+      remindersService,
+      schedulerService,
+      watcherService,
+      hooksService,
+    );
+    registerAllResources(server, connections, imapService, templateService, schedulerService);
+    registerAllPrompts(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: recoverSessionId ? () => recoverSessionId : () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sid: string) => {
+        try {
+          transports[sid] = transport;
+          process.stderr.write(`[email-mcp] session created: ${sid}\n`);
+        } catch (cbErr: unknown) {
+          const cbMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+          process.stderr.write(`[email-mcp] onsessioninitialized error: ${cbMsg}\n`);
+        }
+      },
+    });
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && transports[sid]) {
+        delete transports[sid];
+        process.stderr.write(`[email-mcp] session closed: ${sid}\n`);
+      }
+    };
+
+    transport.onerror = (err: Error) => {
+      const sid = transport.sessionId ?? 'unknown';
+      process.stderr.write(`[email-mcp] transport error (session ${sid}): ${err.message}\n`);
+    };
+
+    await server.connect(transport);
+
+    // Post-handshake: start hooks/watcher/scheduler per session
+    const lowLevelServer = server.server;
+    lowLevelServer.oninitialized = () => {
+      markInitialized();
+      // eslint-disable-next-line no-void
+      void (async () => {
+        try {
+          const clientCaps = lowLevelServer.getClientCapabilities?.() ?? {};
+          hooksService.start(lowLevelServer, { sampling: clientCaps.sampling != null });
+          await watcherService.start();
+        } catch {
+          // non-fatal
+        }
+      })();
+    };
+
+    // --- Session recovery: force-initialise the transport ---
+    if (recoverSessionId) {
+      // The SDK's WebStandardStreamableHTTPServerTransport validates session ID
+      // and _initialized internally.  For a recovered session we must set both
+      // so that subsequent non-init requests are accepted.
+      /* eslint-disable @typescript-eslint/no-explicit-any, no-underscore-dangle */
+      // biome-ignore lint/suspicious/noExplicitAny: accessing SDK-internal transport state for session recovery
+      const inner = (transport as any)._webStandardTransport;
+      inner.sessionId = recoverSessionId;
+      inner._initialized = true;
+      /* eslint-enable @typescript-eslint/no-explicit-any, no-underscore-dangle */
+
+      transports[recoverSessionId] = transport;
+
+      // `oninitialized` won't fire (no init handshake) — start services now.
+      markInitialized();
+      // eslint-disable-next-line no-void
+      void (async () => {
+        try {
+          hooksService.start(lowLevelServer, { sampling: false });
+          await watcherService.start();
+        } catch {
+          // non-fatal
+        }
+      })();
+
+      process.stderr.write(`[email-mcp] session recovered: ${recoverSessionId}\n`);
+    }
+
+    return transport;
+  }
+
+  // -- MCP POST handler -------------------------------------------------------
+  const mcpPostHandler = async (
+    req: IncomingMessage & { body?: unknown },
+    res: ServerResponse,
+  ): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+
+    try {
+      let transport: StreamableHTTPServerTransport;
+
+      if (sessionId && transports[sessionId]) {
+        transport = transports[sessionId];
+        process.stderr.write(
+          `[email-mcp] POST /mcp ${rpcMethod(req.body)} (session ${sessionId.slice(0, 8)}…)\n`,
+        );
+      } else if (isInitializeRequest(req.body)) {
+        process.stderr.write('[email-mcp] POST /mcp — initialize (new session)\n');
+        transport = await initSession();
+
+        await transport.handleRequest(req, res, req.body);
+
+        // Fallback: ensure session is stored even if onsessioninitialized had
+        // a timing issue (e.g. race between @hono/node-server and Express).
+        const sid = transport.sessionId;
+        if (sid && !transports[sid]) {
+          transports[sid] = transport;
+          process.stderr.write(`[email-mcp] session stored (fallback): ${sid}\n`);
+        }
+
+        return;
+      } else if (sessionId) {
+        // Unknown session — auto-recover so clients survive server restarts.
+        // Token auth already guards the endpoint.
+        process.stderr.write(
+          `[email-mcp] POST /mcp ${rpcMethod(req.body)} — recovering session ${sessionId.slice(0, 8)}…\n`,
+        );
+        transport = await initSession(sessionId);
+      } else {
+        process.stderr.write(`[email-mcp] POST /mcp — rejected: no session, not an init request\n`);
+        sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
+        return;
+      }
+
+      await transport.handleRequest(req, res, req.body);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[email-mcp] POST /mcp error: ${msg}\n`);
+      if (!(res as ExpressRes).headersSent) {
+        sendJsonRpcError(res, 500, -32603, 'Internal server error');
+      }
+    }
+  };
+
+  // -- MCP GET handler (SSE streams) ------------------------------------------
+  const mcpGetHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId) {
+      process.stderr.write('[email-mcp] GET /mcp — rejected: no session ID\n');
+      (res as ExpressRes).status(400).send('Missing session ID');
+      return;
+    }
+    if (!transports[sessionId]) {
+      process.stderr.write(`[email-mcp] GET /mcp — recovering session ${sessionId.slice(0, 8)}…\n`);
+      await initSession(sessionId);
+    }
+    process.stderr.write(`[email-mcp] GET /mcp — SSE stream (session ${sessionId.slice(0, 8)}…)\n`);
+    await transports[sessionId].handleRequest(req, res);
+  };
+
+  // -- MCP DELETE handler (session termination) -------------------------------
+  const mcpDeleteHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
+    const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    if (!sessionId || !transports[sessionId]) {
+      // Session already gone — acknowledge silently.
+      process.stderr.write(
+        `[email-mcp] DELETE /mcp — session ${sessionId?.slice(0, 8) ?? 'none'} already gone\n`,
+      );
+      (res as ExpressRes).status(200).send('OK');
+      return;
+    }
+    process.stderr.write(
+      `[email-mcp] DELETE /mcp — terminating session ${sessionId.slice(0, 8)}…\n`,
+    );
+    try {
+      await transports[sessionId].handleRequest(req, res);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      process.stderr.write(`[email-mcp] DELETE /mcp error: ${msg}\n`);
+      if (!(res as ExpressRes).headersSent) {
+        (res as ExpressRes).status(500).send('Error processing session termination');
+      }
+    }
+  };
+
+  // -- Register routes --------------------------------------------------------
+  expressApp.post('/mcp', requireToken, mcpPostHandler);
+  expressApp.get('/mcp', requireToken, mcpGetHandler);
+  expressApp.delete('/mcp', requireToken, mcpDeleteHandler);
+
+  // Health-check endpoint (no token required) — useful for load-balancer probes.
+  expressApp.get('/health', (_req: unknown, res: unknown) => {
+    (res as ExpressRes).status(200).json({ status: 'ok', version: PKG_VERSION });
+  });
+
+  // -- Scheduler (runs regardless of active sessions) -------------------------
+  try {
+    const result = await schedulerService.checkAndSend();
+    if (result.sent > 0) {
+      process.stderr.write(`[email-mcp] Sent ${result.sent} overdue email(s) on startup\n`);
+    }
+  } catch {
+    // Non-fatal
+  }
+
+  const schedulerInterval = setInterval(async () => {
+    try {
+      await schedulerService.checkAndSend();
+    } catch {
+      // Silent
+    }
+  }, 60_000);
+
+  // -- Start HTTP server ------------------------------------------------------
+  // Express app is a callable (req, res) => void compatible with Node's http.createServer,
+  // but its TypeScript type doesn't directly match Node's RequestListener signature.
+  const httpServer = createHttpServer(
+    app as unknown as (req: IncomingMessage, res: ServerResponse) => void,
+  );
+
+  // Increase timeouts for long-lived SSE connections.  The Node.js defaults
+  // (keepAliveTimeout 5 s, headersTimeout 60 s, requestTimeout 5 min) are far
+  // too short for MCP SSE streams that may stay open for the entire session.
+  // Setting to 0 disables the timeout so the connections stay open until the
+  // client disconnects or the server shuts down.
+  httpServer.keepAliveTimeout = 0;
+  httpServer.headersTimeout = 0;
+  httpServer.requestTimeout = 0;
+
+  // Log server-level errors so that they're not silently swallowed.
+  httpServer.on('error', (err: Error) => {
+    process.stderr.write(`[email-mcp] HTTP server error: ${err.message}\n`);
+  });
+
+  // Listen on '::' for dual-stack IPv4 + IPv6 support (important when
+  // connecting via DNS which may resolve to either protocol).
+  httpServer.listen(port, '::', () => {
+    process.stderr.write(`[email-mcp] Streamable HTTP server listening on [::]:${port}\n`);
+    process.stderr.write(`[email-mcp] Endpoint: http://<host>:${port}/mcp?token=<secret>\n`);
+  });
+
+  // Graceful shutdown
+  const shutdown = async () => {
+    clearInterval(schedulerInterval);
+    hooksService.stop();
+    await watcherService.stop();
+
+    await Promise.allSettled(
+      Object.keys(transports).map(async (sid) => {
+        await transports[sid].close();
+        delete transports[sid];
+      }),
+    );
+
+    await connections.closeAll();
+    httpServer.close();
+  };
+
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+}
+
 async function main(): Promise<void> {
   const command = process.argv[2] ?? 'stdio';
 
   switch (command) {
     case 'stdio':
       await runServer();
+      break;
+
+    case 'http':
+      await runHttpServer();
       break;
 
     case 'setup': {

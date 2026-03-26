@@ -338,6 +338,108 @@ async function runHttpServer(): Promise<void> {
     return '?';
   }
 
+  // -- Session initialisation helper ------------------------------------------
+  // Creates a fully-configured MCP server + transport.
+  // If `recoverSessionId` is supplied the transport is force-initialised with
+  // that ID so it can immediately accept non-init requests (session recovery).
+  async function initSession(recoverSessionId?: string): Promise<StreamableHTTPServerTransport> {
+    const server = createServer();
+    bindServer(server);
+
+    registerAllTools(
+      server,
+      connections,
+      imapService,
+      smtpService,
+      config,
+      templateService,
+      calendarService,
+      localCalendarService,
+      remindersService,
+      schedulerService,
+      watcherService,
+      hooksService,
+    );
+    registerAllResources(server, connections, imapService, templateService, schedulerService);
+    registerAllPrompts(server);
+
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: recoverSessionId ? () => recoverSessionId : () => randomUUID(),
+      enableJsonResponse: true,
+      onsessioninitialized: (sid: string) => {
+        try {
+          transports[sid] = transport;
+          process.stderr.write(`[email-mcp] session created: ${sid}\n`);
+        } catch (cbErr: unknown) {
+          const cbMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
+          process.stderr.write(`[email-mcp] onsessioninitialized error: ${cbMsg}\n`);
+        }
+      },
+    });
+
+    transport.onclose = () => {
+      const sid = transport.sessionId;
+      if (sid && transports[sid]) {
+        delete transports[sid];
+        process.stderr.write(`[email-mcp] session closed: ${sid}\n`);
+      }
+    };
+
+    transport.onerror = (err: Error) => {
+      const sid = transport.sessionId ?? 'unknown';
+      process.stderr.write(`[email-mcp] transport error (session ${sid}): ${err.message}\n`);
+    };
+
+    await server.connect(transport);
+
+    // Post-handshake: start hooks/watcher/scheduler per session
+    const lowLevelServer = server.server;
+    lowLevelServer.oninitialized = () => {
+      markInitialized();
+      // eslint-disable-next-line no-void
+      void (async () => {
+        try {
+          const clientCaps = lowLevelServer.getClientCapabilities?.() ?? {};
+          hooksService.start(lowLevelServer, { sampling: clientCaps.sampling != null });
+          await watcherService.start();
+        } catch {
+          // non-fatal
+        }
+      })();
+    };
+
+    // --- Session recovery: force-initialise the transport ---
+    if (recoverSessionId) {
+      // The SDK's WebStandardStreamableHTTPServerTransport validates session ID
+      // and _initialized internally.  For a recovered session we must set both
+      // so that subsequent non-init requests are accepted.
+      /* eslint-disable @typescript-eslint/no-explicit-any, no-underscore-dangle */
+      // biome-ignore lint/suspicious/noExplicitAny: accessing SDK-internal transport state for session recovery
+      const inner = (transport as any)._webStandardTransport;
+      inner.sessionId = recoverSessionId;
+      inner._initialized = true;
+      /* eslint-enable @typescript-eslint/no-explicit-any, no-underscore-dangle */
+
+      transports[recoverSessionId] = transport;
+
+      // `oninitialized` won't fire (no init handshake) — start services now.
+      markInitialized();
+      // eslint-disable-next-line no-void
+      void (async () => {
+        try {
+          hooksService.start(lowLevelServer, { sampling: false });
+          await watcherService.start();
+        } catch {
+          // non-fatal
+        }
+      })();
+
+      process.stderr.write(`[email-mcp] session recovered: ${recoverSessionId}\n`);
+    }
+
+    return transport;
+  }
+
   // -- MCP POST handler -------------------------------------------------------
   const mcpPostHandler = async (
     req: IncomingMessage & { body?: unknown },
@@ -353,72 +455,9 @@ async function runHttpServer(): Promise<void> {
         process.stderr.write(
           `[email-mcp] POST /mcp ${rpcMethod(req.body)} (session ${sessionId.slice(0, 8)}…)\n`,
         );
-      } else if (!sessionId && isInitializeRequest(req.body)) {
+      } else if (isInitializeRequest(req.body)) {
         process.stderr.write('[email-mcp] POST /mcp — initialize (new session)\n');
-        const server = createServer();
-        bindServer(server);
-
-        registerAllTools(
-          server,
-          connections,
-          imapService,
-          smtpService,
-          config,
-          templateService,
-          calendarService,
-          localCalendarService,
-          remindersService,
-          schedulerService,
-          watcherService,
-          hooksService,
-        );
-        registerAllResources(server, connections, imapService, templateService, schedulerService);
-        registerAllPrompts(server);
-
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          enableJsonResponse: true,
-          onsessioninitialized: (sid: string) => {
-            try {
-              transports[sid] = transport;
-              process.stderr.write(`[email-mcp] session created: ${sid}\n`);
-            } catch (cbErr: unknown) {
-              const cbMsg = cbErr instanceof Error ? cbErr.message : String(cbErr);
-              process.stderr.write(`[email-mcp] onsessioninitialized error: ${cbMsg}\n`);
-            }
-          },
-        });
-
-        transport.onclose = () => {
-          const sid = transport.sessionId;
-          if (sid && transports[sid]) {
-            delete transports[sid];
-            process.stderr.write(`[email-mcp] session closed: ${sid}\n`);
-          }
-        };
-
-        transport.onerror = (err: Error) => {
-          const sid = transport.sessionId ?? 'unknown';
-          process.stderr.write(`[email-mcp] transport error (session ${sid}): ${err.message}\n`);
-        };
-
-        await server.connect(transport);
-
-        // Post-handshake: start hooks/watcher/scheduler per session
-        const lowLevelServer = server.server;
-        lowLevelServer.oninitialized = () => {
-          markInitialized();
-          // eslint-disable-next-line no-void
-          void (async () => {
-            try {
-              const clientCaps = lowLevelServer.getClientCapabilities?.() ?? {};
-              hooksService.start(lowLevelServer, { sampling: clientCaps.sampling != null });
-              await watcherService.start();
-            } catch {
-              // non-fatal
-            }
-          })();
-        };
+        transport = await initSession();
 
         await transport.handleRequest(req, res, req.body);
 
@@ -431,11 +470,15 @@ async function runHttpServer(): Promise<void> {
         }
 
         return;
-      } else {
+      } else if (sessionId) {
+        // Unknown session — auto-recover so clients survive server restarts.
+        // Token auth already guards the endpoint.
         process.stderr.write(
-          `[email-mcp] POST /mcp — rejected: session=${sessionId ?? 'none'}, ` +
-            `isInit=${isInitializeRequest(req.body)}\n`,
+          `[email-mcp] POST /mcp ${rpcMethod(req.body)} — recovering session ${sessionId.slice(0, 8)}…\n`,
         );
+        transport = await initSession(sessionId);
+      } else {
+        process.stderr.write(`[email-mcp] POST /mcp — rejected: no session, not an init request\n`);
         sendJsonRpcError(res, 400, -32000, 'Bad Request: No valid session ID provided');
         return;
       }
@@ -453,12 +496,14 @@ async function runHttpServer(): Promise<void> {
   // -- MCP GET handler (SSE streams) ------------------------------------------
   const mcpGetHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
-    if (!sessionId || !transports[sessionId]) {
-      process.stderr.write(
-        `[email-mcp] GET /mcp — rejected: session=${sessionId ?? 'none'} not found\n`,
-      );
-      (res as ExpressRes).status(400).send('Invalid or missing session ID');
+    if (!sessionId) {
+      process.stderr.write('[email-mcp] GET /mcp — rejected: no session ID\n');
+      (res as ExpressRes).status(400).send('Missing session ID');
       return;
+    }
+    if (!transports[sessionId]) {
+      process.stderr.write(`[email-mcp] GET /mcp — recovering session ${sessionId.slice(0, 8)}…\n`);
+      await initSession(sessionId);
     }
     process.stderr.write(`[email-mcp] GET /mcp — SSE stream (session ${sessionId.slice(0, 8)}…)\n`);
     await transports[sessionId].handleRequest(req, res);
@@ -468,10 +513,11 @@ async function runHttpServer(): Promise<void> {
   const mcpDeleteHandler = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
     if (!sessionId || !transports[sessionId]) {
+      // Session already gone — acknowledge silently.
       process.stderr.write(
-        `[email-mcp] DELETE /mcp — rejected: session=${sessionId ?? 'none'} not found\n`,
+        `[email-mcp] DELETE /mcp — session ${sessionId?.slice(0, 8) ?? 'none'} already gone\n`,
       );
-      (res as ExpressRes).status(400).send('Invalid or missing session ID');
+      (res as ExpressRes).status(200).send('OK');
       return;
     }
     process.stderr.write(
